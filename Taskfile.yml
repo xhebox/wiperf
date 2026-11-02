@@ -1,0 +1,33 @@
+version: '3'
+
+vars:
+  # Every target a release ships.
+  TARGETS: x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-pc-windows-msvc
+
+tasks:
+  check:
+    desc: "Format and lint every target"
+    cmds:
+      - cargo fmt --all --check
+      - for: { var: TARGETS }
+        task: check-target
+        vars: { TARGET: '{{.ITEM}}' }
+
+  check-target:
+    internal: true
+    cmds:
+      - cargo clippy --all-targets --locked --target {{.TARGET}} {{.CLI_ARGS}}
+
+  test:
+    desc: "Run every test on the host"
+    cmds:
+      - cargo nextest run --locked {{.CLI_ARGS}}
+
+  build:
+    desc: "Build the release tarball for TARGET into dist/"
+    requires:
+      vars: [TARGET]
+    cmds:
+      - cargo build --release --locked --target {{.TARGET}}
+      - mkdir -p dist
+      - tar -czf 'dist/wiperf-{{.TARGET}}.tar.gz' -C 'target/{{.TARGET}}/release' 'wiperf{{if contains "windows" .TARGET}}.exe{{end}}'
