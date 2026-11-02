@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use argh::FromArgs;
 use wiperf::{
 	Counters, DEFAULT_PORT, Report, SocketStream, TestParams, bind_tcp, bind_unix, connect_tcp_any,
-	connect_unix, resolve, run_stream_client, run_udp_client, serve_ip_once, serve_stream_once,
-	to_io,
+	connect_unix, resolve, run_stream_client, run_udp_client, serve_ip_once, serve_stream_listener,
+	serve_stream_once, to_io,
 };
 
 /// Lightweight iperf3-compatible network and vsock benchmark tool.
@@ -109,17 +109,20 @@ async fn run(args: Args) -> io::Result<()> {
 async fn run_server(args: &Args) -> io::Result<()> {
 	if let Some(path) = &args.unix {
 		let listener = bind_unix(path)?;
-		loop {
+		if args.one_off {
 			let (params, report) = serve_stream_once(|| async {
 				let sock = listener.accept().await.map_err(to_io)?;
 				Ok(SocketStream::new(sock))
 			})
 			.await?;
 			print_summary(&params, &report, args.json);
-			if args.one_off {
-				return Ok(());
-			}
+			return Ok(());
 		}
+		let json = args.json;
+		return serve_stream_listener(&listener, move |params, report| {
+			print_summary(&params, &report, json);
+		})
+		.await;
 	}
 
 	#[cfg(not(target_os = "linux"))]
@@ -130,17 +133,20 @@ async fn run_server(args: &Args) -> io::Result<()> {
 	#[cfg(target_os = "linux")]
 	if args.vsock {
 		let listener = wiperf::bind_vsock(args.port)?;
-		loop {
+		if args.one_off {
 			let (params, report) = serve_stream_once(|| async {
 				let sock = listener.accept().await.map_err(to_io)?;
 				Ok(SocketStream::new(sock))
 			})
 			.await?;
 			print_summary(&params, &report, args.json);
-			if args.one_off {
-				return Ok(());
-			}
+			return Ok(());
 		}
+		let json = args.json;
+		return serve_stream_listener(&listener, move |params, report| {
+			print_summary(&params, &report, json);
+		})
+		.await;
 	}
 
 	let bind_addr: SocketAddr = format!("0.0.0.0:{}", args.port)

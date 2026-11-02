@@ -7,14 +7,17 @@
 //! closure, which is why TCP, `AF_UNIX`, `AF_VSOCK`, and an SSH `direct-tcpip`
 //! channel all run the same code.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::Shutdown;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use completion::{Buffer, StreamSocket, timeout};
+use completion::{Buffer, Listener, StreamSocket, timeout};
 use event_listener::Event;
 use futures_util::future::{Either, select};
 use futures_util::pin_mut;
@@ -426,6 +429,126 @@ where
 	}
 	let report = serve_stream_session(&mut ctrl, &cookie, &params, &mut accept).await?;
 	Ok((params, report))
+}
+
+/// Active sessions waiting for their client to open data streams, keyed by
+/// the 37-byte session cookie.
+type Routes = Rc<RefCell<HashMap<[u8; COOKIE_SIZE], Rc<DataQueue>>>>;
+
+/// Replays the cookie consumed while routing a data connection. Control
+/// connections have an empty prelude because [`serve_stream_control`] already
+/// takes their cookie as an argument.
+struct Prelude {
+	cookie: Vec<u8>,
+	offset: usize,
+	stream: SocketStream,
+}
+
+impl Prelude {
+	fn new(stream: SocketStream, cookie: Vec<u8>) -> Self {
+		Self {
+			cookie,
+			offset: 0,
+			stream,
+		}
+	}
+}
+
+impl StreamIo for Prelude {
+	async fn read_into(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		if self.offset < self.cookie.len() {
+			let take = (self.cookie.len() - self.offset).min(buf.len());
+			buf[..take].copy_from_slice(&self.cookie[self.offset..self.offset + take]);
+			self.offset += take;
+			return Ok(take);
+		}
+		self.stream.read_into(buf).await
+	}
+
+	async fn write_all_bytes(&mut self, buf: &[u8]) -> io::Result<()> {
+		self.stream.write_all_bytes(buf).await
+	}
+
+	async fn shutdown_write(&mut self) -> io::Result<()> {
+		self.stream.shutdown_write().await
+	}
+}
+
+struct DataQueue {
+	sockets: RefCell<VecDeque<Prelude>>,
+	event: Event,
+}
+
+impl DataQueue {
+	fn new() -> Self {
+		Self {
+			sockets: RefCell::new(VecDeque::new()),
+			event: Event::new(),
+		}
+	}
+
+	fn push(&self, socket: Prelude) {
+		self.sockets.borrow_mut().push_back(socket);
+		self.event.notify(usize::MAX);
+	}
+
+	async fn pop(&self) -> io::Result<Prelude> {
+		loop {
+			let listener = self.event.listen();
+			if let Some(socket) = self.sockets.borrow_mut().pop_front() {
+				return Ok(socket);
+			}
+			listener.await;
+		}
+	}
+}
+
+/// Serves concurrent stream sessions on `listener`, routing each accepted
+/// connection by its 37-byte cookie so one active or stalled session does not
+/// block another from handshaking or transferring.
+pub async fn serve_stream_listener<F>(listener: &Listener, on_session: F) -> io::Result<()>
+where
+	F: Fn(TestParams, Report) + 'static,
+{
+	let routes: Routes = Rc::new(RefCell::new(HashMap::new()));
+	let on_session = Rc::new(on_session);
+	loop {
+		let socket = listener.accept().await.map_err(to_io)?;
+		let routes = Rc::clone(&routes);
+		let on_session = Rc::clone(&on_session);
+		drop(completion::spawn(async move {
+			let mut ctrl = SocketStream::new(socket);
+			let mut cookie = [0u8; COOKIE_SIZE];
+			if let Err(error) = control(
+				"reading the session cookie",
+				read_exact(&mut ctrl, &mut cookie),
+			)
+			.await
+			{
+				log::debug!("wiperf: {error}");
+				return;
+			}
+			if let Some(queue) = routes.borrow().get(&cookie).cloned() {
+				queue.push(Prelude::new(ctrl, cookie.to_vec()));
+				return;
+			}
+			let queue = Rc::new(DataQueue::new());
+			routes.borrow_mut().insert(cookie, Rc::clone(&queue));
+			let accept = {
+				let queue = Rc::clone(&queue);
+				move || {
+					let queue = Rc::clone(&queue);
+					async move { queue.pop().await }
+				}
+			};
+			let ctrl = Prelude::new(ctrl, Vec::new());
+			match serve_stream_control(ctrl, cookie, accept).await {
+				Ok((params, report)) => on_session(params, report),
+				Err(error) => log::debug!("wiperf: session ended: {error}"),
+			}
+			routes.borrow_mut().remove(&cookie);
+		}));
+	}
 }
 
 /// Serves one stream test after its parameters were read.

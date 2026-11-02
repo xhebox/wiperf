@@ -42,7 +42,7 @@ pub use protocol::{
 };
 pub use stream::{
 	SocketStream, Stop, StreamIo, absorb_stream, blast_stream, build_report, read_exact,
-	run_stream_client, serve_stream_control, serve_stream_once,
+	run_stream_client, serve_stream_control, serve_stream_listener, serve_stream_once,
 };
 pub use transport::{bind_tcp, bind_unix, connect_tcp, connect_tcp_any, connect_unix, resolve};
 #[cfg(target_os = "linux")]
@@ -82,7 +82,7 @@ mod tests {
 	use super::{
 		SocketStream, TestParams, TestState, bind_tcp, bind_unix, connect_tcp, connect_unix,
 		make_cookie, next_stream_id, run_stream_client, run_udp_client, serve_ip_once,
-		serve_stream_once, to_io,
+		serve_stream_listener, serve_stream_once, to_io,
 	};
 
 	fn tempdir() -> tempfile::TempDir {
@@ -322,5 +322,45 @@ mod tests {
 			std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AlreadyExists
 		));
 		assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+	}
+
+	#[test]
+	fn concurrent_stream_sessions_do_not_block_each_other() {
+		let dir = tempdir();
+		let path = dir.path().join("concurrent.sock");
+		let listener = bind_unix(&path).unwrap();
+
+		// Hold one session open after its cookie so a serial accept loop would
+		// block behind it, then run a complete second session beside it.
+		let stalled_path = path.clone();
+		let stalled = std::thread::spawn(move || {
+			let mut ctrl = std::os::unix::net::UnixStream::connect(&stalled_path).unwrap();
+			ctrl.write_all(&make_cookie()).unwrap();
+			let mut state = [0u8; 1];
+			ctrl.read_exact(&mut state).unwrap();
+			assert_eq!(
+				TestState::from_wire(state[0] as i8).unwrap(),
+				TestState::ParamExchange
+			);
+			std::thread::sleep(Duration::from_millis(400));
+		});
+
+		completion::block_on(async {
+			let server = completion::spawn(async move {
+				drop(serve_stream_listener(&listener, |_, _| {}).await);
+			});
+			let client_path = path.clone();
+			let report = run_stream_client(&params(1, 0), || {
+				let client_path = client_path.clone();
+				async move { connect_unix(&client_path) }
+			})
+			.await
+			.unwrap();
+			assert_eq!(report.streams.len(), 1);
+			assert!(report.streams[0].sender.unwrap().bytes > 0);
+			drop(server);
+		})
+		.unwrap();
+		stalled.join().unwrap();
 	}
 }
